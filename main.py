@@ -1,11 +1,13 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict
 import uvicorn
 import sqlite3
 import hashlib
 import random
 import string
+import json
+import asyncio
 from datetime import datetime
 
 # AJOUTE CET IMPORT
@@ -28,6 +30,41 @@ app.add_middleware(
     expose_headers=["*"], # Expose tous les headers au frontend
 )
 # ==================== FIN DU BLOC CORS ====================
+
+# ==================== WEBSOCKET MANAGER ====================
+class ConnectionManager:
+    def __init__(self):
+        # Stockage: {user_id: websocket}
+        self.active_connections: Dict[str, WebSocket] = {}
+    
+    async def connect(self, websocket: WebSocket, user_id: str):
+        await websocket.accept()
+        self.active_connections[user_id] = websocket
+        print(f"🔌 WebSocket connecté pour user: {user_id}")
+    
+    def disconnect(self, user_id: str):
+        if user_id in self.active_connections:
+            del self.active_connections[user_id]
+            print(f"👋 WebSocket déconnecté pour user: {user_id}")
+    
+    async def send_personal_message(self, message: dict, user_id: str):
+        if user_id in self.active_connections:
+            websocket = self.active_connections[user_id]
+            try:
+                await websocket.send_json(message)
+                print(f"📤 Message envoyé à user {user_id}")
+            except:
+                self.disconnect(user_id)
+    
+    async def broadcast(self, message: dict):
+        for user_id, websocket in self.active_connections.items():
+            try:
+                await websocket.send_json(message)
+            except:
+                self.disconnect(user_id)
+
+# Instance globale
+manager = ConnectionManager()
 
 # === FONCTIONS DE BASE ===
 def hash_password(password: str) -> str:
@@ -88,14 +125,35 @@ class OrderItem(BaseModel):
     quantity: int
 
 class MultiOrderCreate(BaseModel):
-    items: List[OrderItem]  # Liste de produits avec quantités
+    items: List[OrderItem]
     customer_phone: str
     customer_email: Optional[str] = None
     delivery_address: str
     notes: Optional[str] = None
 
 class OrderStatusUpdate(BaseModel):
-    status: str  # pending, processing, shipped, delivered, cancelled
+    status: str
+
+# MODÈLES POUR NOTIFICATIONS
+class NotificationBase(BaseModel):
+    user_id: int
+    type: str = "system"
+    title: str
+    message: str
+    link: Optional[str] = ""
+    icon: Optional[str] = "bell"
+    data: Optional[dict] = {}
+
+class NotificationCreate(NotificationBase):
+    pass
+
+class NotificationResponse(NotificationBase):
+    id: int
+    read: bool
+    created_at: str
+    
+    class Config:
+        from_attributes = True
 
 # === INITIALISATION BASE DE DONNÉES ===
 def init_db():
@@ -104,7 +162,7 @@ def init_db():
     cursor = conn.cursor()
     
     # Supprimer tables existantes
-    tables = ["order_items", "orders", "products", "shops", "users"]
+    tables = ["order_items", "orders", "products", "shops", "users", "notifications"]
     for table in tables:
         cursor.execute(f"DROP TABLE IF EXISTS {table}")
     
@@ -173,6 +231,23 @@ def init_db():
     )
     ''')
     
+    # Créer table notifications
+    cursor.execute('''
+    CREATE TABLE notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        type TEXT DEFAULT 'system',
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        link TEXT DEFAULT '',
+        icon TEXT DEFAULT 'bell',
+        read BOOLEAN DEFAULT 0,
+        data TEXT DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id)
+    )
+    ''')
+    
     conn.commit()
     
     # Ajouter admin de test
@@ -225,9 +300,19 @@ def init_db():
             (order_id, test_products[1]['id'], 1, test_products[1]['price'])
         )
     
+    # Ajouter une notification de test
+    cursor.execute(
+        """INSERT INTO notifications 
+           (user_id, type, title, message, link, icon, data) 
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (admin_id, "system", "Bienvenue sur Marketplace", 
+         "Votre compte administrateur a été créé avec succès.", 
+         "/dashboard", "bell", '{"welcome": true}')
+    )
+    
     conn.commit()
     conn.close()
-    print("✅ Base de données initialisée avec commandes multi-produits")
+    print("✅ Base de données initialisée avec notifications")
 
 # Lancer l'initialisation
 init_db()
@@ -237,21 +322,20 @@ init_db()
 def home():
     return {
         "message": "Marketplace Alger API 🚀",
-        "version": "3.0",
-        "features": ["rôles utilisateurs", "dashboard shop", "commandes multi-produits"],
+        "version": "4.0",
+        "features": ["rôles utilisateurs", "dashboard shop", "commandes multi-produits", "notifications temps réel"],
         "endpoints": [
-            "POST /register - S'inscrire (customer/shop/admin)",
+            "POST /register - S'inscrire",
             "POST /login - Se connecter",
             "GET /me - Info utilisateur",
             "GET /products - Liste produits",
-            "POST /products - Créer produit (public)",
-            "GET /shop/products - Produits d'un shop",
-            "POST /shop/products - Créer produit (shop)",
-            "POST /orders - Créer commande (multi-produits)",
-            "GET /orders/{phone} - Voir commandes par téléphone",
-            "GET /orders/user/{email} - Voir commandes par email",
-            "GET /orders/shop/{owner_email} - Commandes d'un shop",
-            "PUT /orders/{order_id}/status - Mettre à jour le statut"
+            "POST /orders - Créer commande",
+            "GET /orders/{phone} - Voir commandes",
+            "PUT /orders/{order_id}/status - Mettre à jour le statut",
+            "WS /ws/{user_id} - Connexion WebSocket",
+            "POST /api/notifications - Créer notification",
+            "GET /api/notifications/{user_id} - Récupérer notifications",
+            "POST /api/notifications/test/{user_id} - Tester notifications"
         ]
     }
 
@@ -286,7 +370,7 @@ def register(user: UserCreate):
         
         # Vérifier le rôle
         if user.role not in ["customer", "shop", "admin"]:
-            raise HTTPException(400, "Rôle invalide: doit être customer, shop ou admin")
+            raise HTTPException(400, "Rôle invalide")
         
         # Créer utilisateur
         hashed = hash_password(user.password)
@@ -357,7 +441,6 @@ def login(credentials: UserLogin):
 
 @app.get("/me")
 def get_me(email: str):
-    """Récupérer les informations de l'utilisateur connecté"""
     conn = get_db()
     cursor = conn.cursor()
     
@@ -386,10 +469,9 @@ def get_me(email: str):
     finally:
         conn.close()
 
-# === PRODUITS PUBLICS ===
+# === PRODUITS ===
 @app.post("/products")
 def create_product(product: ProductCreate):
-    """Créer un produit (public - pour tests)"""
     conn = get_db()
     cursor = conn.cursor()
     
@@ -446,36 +528,13 @@ def get_products(category: Optional[str] = None):
     finally:
         conn.close()
 
-@app.get("/products/{product_id}")
-def get_product(product_id: int):
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute(
-            "SELECT p.*, s.name as shop_name FROM products p JOIN shops s ON p.shop_id = s.id WHERE p.id = ?",
-            (product_id,)
-        )
-        
-        product = row_to_dict(cursor.fetchone())
-        
-        if not product:
-            raise HTTPException(404, "Produit non trouvé")
-        
-        return product
-        
-    finally:
-        conn.close()
-
-# === ROUTES SHOP (FOURNISSEURS) ===
+# === ROUTES SHOP ===
 @app.get("/shop/products")
 def get_shop_products(owner_email: str):
-    """Récupérer tous les produits d'un shop spécifique"""
     conn = get_db()
     cursor = conn.cursor()
     
     try:
-        # Trouver le shop de cet utilisateur
         cursor.execute(
             """SELECT s.id as shop_id 
                FROM users u 
@@ -486,9 +545,8 @@ def get_shop_products(owner_email: str):
         shop = row_to_dict(cursor.fetchone())
         
         if not shop:
-            raise HTTPException(403, "Accès réservé aux fournisseurs ou shop non trouvé")
+            raise HTTPException(403, "Accès réservé aux fournisseurs")
         
-        # Récupérer les produits de ce shop
         cursor.execute(
             "SELECT * FROM products WHERE shop_id = ? ORDER BY id DESC",
             (shop['shop_id'],)
@@ -506,12 +564,10 @@ def get_shop_products(owner_email: str):
 
 @app.post("/shop/products")
 def create_shop_product(product: ShopProductCreate, owner_email: str):
-    """Créer un produit pour un shop (version JSON corrigée)"""
     conn = get_db()
     cursor = conn.cursor()
     
     try:
-        # Vérifier que l'utilisateur est un shop
         cursor.execute(
             """SELECT s.id as shop_id 
                FROM users u 
@@ -524,7 +580,6 @@ def create_shop_product(product: ShopProductCreate, owner_email: str):
         if not shop:
             raise HTTPException(403, "Accès réservé aux fournisseurs")
         
-        # Créer le produit
         cursor.execute(
             """INSERT INTO products (name, description, price, stock, category, shop_id) 
                VALUES (?, ?, ?, ?, ?, ?)""",
@@ -534,7 +589,6 @@ def create_shop_product(product: ShopProductCreate, owner_email: str):
         
         conn.commit()
         
-        # Retourner le produit créé
         cursor.execute("SELECT * FROM products WHERE id = ?", (product_id,))
         product_data = row_to_dict(cursor.fetchone())
         
@@ -547,9 +601,9 @@ def create_shop_product(product: ShopProductCreate, owner_email: str):
     finally:
         conn.close()
 
-# === COMMANDES (NOUVELLES ROUTES MULTI-PRODUITS) ===
+# === COMMANDES ===
 @app.post("/orders")
-def create_order(order: MultiOrderCreate):
+async def create_order(order: MultiOrderCreate):
     """Créer une commande avec plusieurs produits"""
     conn = get_db()
     cursor = conn.cursor()
@@ -569,11 +623,9 @@ def create_order(order: MultiOrderCreate):
             if product['stock'] < item.quantity:
                 raise HTTPException(400, f"Stock insuffisant pour {product['name']}: {product['stock']} disponible")
             
-            # Calculer le prix pour cet item
             item_total = product['price'] * item.quantity
             total_price += item_total
             
-            # Préparer les données de l'item
             order_items.append({
                 'product_id': product['id'],
                 'product_name': product['name'],
@@ -603,7 +655,6 @@ def create_order(order: MultiOrderCreate):
                 (order_id, item['product_id'], item['quantity'], item['unit_price'])
             )
             
-            # Mettre à jour le stock du produit
             cursor.execute(
                 "UPDATE products SET stock = stock - ? WHERE id = ?",
                 (item['quantity'], item['product_id'])
@@ -611,14 +662,14 @@ def create_order(order: MultiOrderCreate):
         
         conn.commit()
         
-        # Récupérer la commande créée avec ses items
+        # Récupérer la commande créée
         cursor.execute(
             """SELECT o.* FROM orders o WHERE o.id = ?""",
             (order_id,)
         )
         order_data = row_to_dict(cursor.fetchone())
         
-        # Récupérer les items de la commande
+        # Récupérer les items
         cursor.execute(
             """SELECT oi.*, p.name as product_name, p.shop_id, s.name as shop_name 
                FROM order_items oi 
@@ -630,6 +681,19 @@ def create_order(order: MultiOrderCreate):
         items = [row_to_dict(row) for row in cursor.fetchall()]
         
         order_data['items'] = items
+        
+        # NOTIFICATION : Envoyer une notification à l'admin (user_id = 1)
+        notification_task = asyncio.create_task(
+            create_notification(NotificationCreate(
+                user_id=1,  # ID de l'admin
+                type="order",
+                title="Nouvelle commande",
+                message=f"Commande #{order_number} reçue de {order.customer_phone}",
+                link=f"/admin/orders/{order_id}",
+                icon="shopping-cart",
+                data={"order_id": order_id, "order_number": order_number}
+            ))
+        )
         
         return {
             "success": True,
@@ -649,7 +713,6 @@ def create_order(order: MultiOrderCreate):
 
 @app.get("/orders/{phone}")
 def get_orders_by_phone(phone: str):
-    """Récupérer toutes les commandes d'un client par téléphone"""
     conn = get_db()
     cursor = conn.cursor()
     
@@ -660,7 +723,6 @@ def get_orders_by_phone(phone: str):
         )
         orders = [row_to_dict(row) for row in cursor.fetchall()]
         
-        # Pour chaque commande, récupérer les items
         for order in orders:
             cursor.execute(
                 """SELECT oi.*, p.name as product_name 
@@ -679,10 +741,8 @@ def get_orders_by_phone(phone: str):
     finally:
         conn.close()
 
-# NOUVELLE ROUTE : Commandes par email
 @app.get("/orders/user/{email}")
 def get_orders_by_email(email: str):
-    """Récupérer toutes les commandes d'un client par email"""
     conn = get_db()
     cursor = conn.cursor()
     
@@ -693,7 +753,6 @@ def get_orders_by_email(email: str):
         )
         orders = [row_to_dict(row) for row in cursor.fetchall()]
         
-        # Pour chaque commande, récupérer les items
         for order in orders:
             cursor.execute(
                 """SELECT oi.*, p.name as product_name 
@@ -712,15 +771,12 @@ def get_orders_by_email(email: str):
     finally:
         conn.close()
 
-# NOUVELLE ROUTE : Commandes d'un shop
 @app.get("/orders/shop/{owner_email}")
 def get_shop_orders(owner_email: str):
-    """Récupérer toutes les commandes pour les produits d'un shop"""
     conn = get_db()
     cursor = conn.cursor()
     
     try:
-        # Trouver le shop de cet utilisateur
         cursor.execute(
             """SELECT s.id as shop_id 
                FROM users u 
@@ -733,7 +789,6 @@ def get_shop_orders(owner_email: str):
         if not shop:
             raise HTTPException(403, "Accès réservé aux fournisseurs")
         
-        # Récupérer toutes les commandes qui contiennent des produits de ce shop
         cursor.execute(
             """SELECT DISTINCT o.* 
                FROM orders o
@@ -745,7 +800,6 @@ def get_shop_orders(owner_email: str):
         )
         orders = [row_to_dict(row) for row in cursor.fetchall()]
         
-        # Pour chaque commande, récupérer les items (seulement ceux de ce shop)
         for order in orders:
             cursor.execute(
                 """SELECT oi.*, p.name as product_name, p.shop_id 
@@ -765,20 +819,16 @@ def get_shop_orders(owner_email: str):
     finally:
         conn.close()
 
-# NOUVELLE ROUTE : Mettre à jour le statut d'une commande
 @app.put("/orders/{order_id}/status")
-def update_order_status(order_id: int, status_update: OrderStatusUpdate):
-    """Mettre à jour le statut d'une commande"""
+async def update_order_status(order_id: int, status_update: OrderStatusUpdate):
     conn = get_db()
     cursor = conn.cursor()
     
     try:
-        # Vérifier que la commande existe
         cursor.execute("SELECT id FROM orders WHERE id = ?", (order_id,))
         if not cursor.fetchone():
             raise HTTPException(404, "Commande non trouvée")
         
-        # Mettre à jour le statut
         cursor.execute(
             "UPDATE orders SET status = ? WHERE id = ?",
             (status_update.status, order_id)
@@ -786,9 +836,22 @@ def update_order_status(order_id: int, status_update: OrderStatusUpdate):
         
         conn.commit()
         
-        # Récupérer la commande mise à jour
         cursor.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
         order = row_to_dict(cursor.fetchone())
+        
+        # NOTIFICATION : Envoyer une notification au client si son user_id est connu
+        # Ici on envoie à l'admin pour l'exemple
+        notification_task = asyncio.create_task(
+            create_notification(NotificationCreate(
+                user_id=1,
+                type="order",
+                title="Statut de commande mis à jour",
+                message=f"Commande #{order['order_number']} est maintenant {status_update.status}",
+                link=f"/orders/{order_id}",
+                icon="package",
+                data={"order_id": order_id, "status": status_update.status}
+            ))
+        )
         
         return {
             "success": True,
@@ -803,10 +866,170 @@ def update_order_status(order_id: int, status_update: OrderStatusUpdate):
     finally:
         conn.close()
 
-# === ROUTES ADMIN (FACULTATIVES) ===
+# ==================== WEBSOCKET ENDPOINT ====================
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    await manager.connect(websocket, user_id)
+    
+    try:
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong")
+            
+    except WebSocketDisconnect:
+        manager.disconnect(user_id)
+
+# ==================== NOTIFICATIONS API ====================
+@app.post("/api/notifications")
+async def create_notification(notification: NotificationCreate):
+    """Créer une notification"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(
+            """INSERT INTO notifications 
+               (user_id, type, title, message, link, icon, data) 
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (notification.user_id, notification.type, notification.title, 
+             notification.message, notification.link, notification.icon,
+             json.dumps(notification.data or {}))
+        )
+        notification_id = cursor.lastrowid
+        
+        conn.commit()
+        
+        cursor.execute(
+            "SELECT * FROM notifications WHERE id = ?",
+            (notification_id,)
+        )
+        notif_data = row_to_dict(cursor.fetchone())
+        
+        # Convertir data de JSON string à dict
+        if notif_data.get('data'):
+            notif_data['data'] = json.loads(notif_data['data'])
+        
+        # Envoyer via WebSocket
+        await manager.send_personal_message({
+            "type": "new_notification",
+            "notification": notif_data
+        }, str(notification.user_id))
+        
+        return {
+            "success": True,
+            "notification": notif_data
+        }
+        
+    except Exception as e:
+        print(f"❌ Erreur création notification: {e}")
+        raise HTTPException(500, f"Erreur: {str(e)}")
+    finally:
+        conn.close()
+
+@app.get("/api/notifications/{user_id}")
+def get_user_notifications(user_id: int):
+    """Récupérer les notifications d'un utilisateur"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(
+            """SELECT * FROM notifications 
+               WHERE user_id = ? 
+               ORDER BY created_at DESC 
+               LIMIT 20""",
+            (user_id,)
+        )
+        notifications = [row_to_dict(row) for row in cursor.fetchall()]
+        
+        for notif in notifications:
+            if notif.get('data'):
+                notif['data'] = json.loads(notif['data'])
+        
+        return {
+            "success": True,
+            "count": len(notifications),
+            "notifications": notifications
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Erreur: {str(e)}")
+    finally:
+        conn.close()
+
+@app.put("/api/notifications/{notification_id}/read")
+def mark_notification_as_read(notification_id: int):
+    """Marquer une notification comme lue"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(
+            "UPDATE notifications SET read = 1 WHERE id = ?",
+            (notification_id,)
+        )
+        conn.commit()
+        
+        return {"success": True, "message": "Notification marquée comme lue"}
+    except Exception as e:
+        raise HTTPException(500, f"Erreur: {str(e)}")
+    finally:
+        conn.close()
+
+@app.put("/api/notifications/user/{user_id}/read-all")
+def mark_all_as_read(user_id: int):
+    """Marquer toutes les notifications comme lues"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(
+            "UPDATE notifications SET read = 1 WHERE user_id = ? AND read = 0",
+            (user_id,)
+        )
+        conn.commit()
+        
+        return {"success": True, "message": "Toutes les notifications marquées comme lues"}
+    except Exception as e:
+        raise HTTPException(500, f"Erreur: {str(e)}")
+    finally:
+        conn.close()
+
+@app.delete("/api/notifications/{notification_id}")
+def delete_notification(notification_id: int):
+    """Supprimer une notification"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("DELETE FROM notifications WHERE id = ?", (notification_id,))
+        conn.commit()
+        
+        return {"success": True, "message": "Notification supprimée"}
+    except Exception as e:
+        raise HTTPException(500, f"Erreur: {str(e)}")
+    finally:
+        conn.close()
+
+# Route de test
+@app.post("/api/notifications/test/{user_id}")
+async def test_notification(user_id: int):
+    """Tester le système de notifications"""
+    test_notif = NotificationCreate(
+        user_id=user_id,
+        type="system",
+        title="Notification de test",
+        message="Ceci est une notification de test pour vérifier le système.",
+        link="/dashboard",
+        icon="bell",
+        data={"test": True, "timestamp": datetime.now().isoformat()}
+    )
+    
+    return await create_notification(test_notif)
+
+# === ROUTES ADMIN ===
 @app.get("/admin/users")
 def get_all_users():
-    """Récupérer tous les utilisateurs (admin seulement)"""
     conn = get_db()
     cursor = conn.cursor()
     
@@ -823,28 +1046,22 @@ def get_all_users():
 
 @app.get("/admin/stats")
 def get_admin_stats():
-    """Statistiques pour admin"""
     conn = get_db()
     cursor = conn.cursor()
     
     try:
-        # Compter les utilisateurs par rôle
         cursor.execute("SELECT role, COUNT(*) as count FROM users GROUP BY role")
         roles_stats = [row_to_dict(row) for row in cursor.fetchall()]
         
-        # Compter les produits
         cursor.execute("SELECT COUNT(*) as total_products FROM products")
         total_products = cursor.fetchone()[0]
         
-        # Compter les commandes
         cursor.execute("SELECT COUNT(*) as total_orders FROM orders")
         total_orders = cursor.fetchone()[0]
         
-        # Chiffre d'affaires total
         cursor.execute("SELECT SUM(total_price) as total_revenue FROM orders")
         total_revenue = cursor.fetchone()[0] or 0
         
-        # Commandes par statut
         cursor.execute("SELECT status, COUNT(*) as count FROM orders GROUP BY status")
         orders_by_status = [row_to_dict(row) for row in cursor.fetchall()]
         
@@ -863,6 +1080,8 @@ if __name__ == "__main__":
     print("📊 Système de rôles activé (customer/shop/admin)")
     print("🛒 Commandes multi-produits disponibles")
     print("🏪 Dashboard shop complet")
+    print("🔔 Notifications temps réel activées")
     print("🌐 API: http://localhost:8000")
+    print("🔌 WebSocket: ws://localhost:8000/ws/{user_id}")
     print("📚 Docs: http://localhost:8000/docs")
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
