@@ -16,18 +16,14 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Marketplace Alger API")
 
 # ==================== AJOUTE CE BLOC CORS ====================
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",    # Frontend Vite
-        "http://127.0.0.1:5173",    # Alternative
-        "http://localhost:3000",     # React par défaut
-        "http://127.0.0.1:3000",    # Alternative
-    ],
+    allow_origins=["*"],  # En développement seulement!
     allow_credentials=True,
-    allow_methods=["*"],  # Permet GET, POST, PUT, DELETE, OPTIONS, etc.
-    allow_headers=["*"],  # Permet tous les headers
-    expose_headers=["*"], # Expose tous les headers au frontend
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
 )
 # ==================== FIN DU BLOC CORS ====================
 
