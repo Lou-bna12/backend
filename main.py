@@ -4,6 +4,9 @@ from typing import Optional, List
 import uvicorn
 import sqlite3
 import hashlib
+import random
+import string
+from datetime import datetime
 
 # AJOUTE CET IMPORT
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,6 +44,12 @@ def row_to_dict(row):
     """Convertir une row SQLite en dictionnaire"""
     return dict(row) if row else None
 
+def generate_order_number():
+    """Génère un numéro de commande unique"""
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    random_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"CMD-{timestamp}-{random_str}"
+
 # === MODÈLES PYDANTIC ===
 class UserCreate(BaseModel):
     email: str
@@ -73,6 +82,21 @@ class OrderCreate(BaseModel):
     quantity: int
     delivery_address: str
 
+# NOUVEAUX MODÈLES POUR COMMANDES MULTI-PRODUITS
+class OrderItem(BaseModel):
+    product_id: int
+    quantity: int
+
+class MultiOrderCreate(BaseModel):
+    items: List[OrderItem]  # Liste de produits avec quantités
+    customer_phone: str
+    customer_email: Optional[str] = None
+    delivery_address: str
+    notes: Optional[str] = None
+
+class OrderStatusUpdate(BaseModel):
+    status: str  # pending, processing, shipped, delivered, cancelled
+
 # === INITIALISATION BASE DE DONNÉES ===
 def init_db():
     """Créer les tables et données de test"""
@@ -80,7 +104,7 @@ def init_db():
     cursor = conn.cursor()
     
     # Supprimer tables existantes
-    tables = ["orders", "products", "shops", "users"]
+    tables = ["order_items", "orders", "products", "shops", "users"]
     for table in tables:
         cursor.execute(f"DROP TABLE IF EXISTS {table}")
     
@@ -121,17 +145,30 @@ def init_db():
     )
     ''')
     
-    # Créer table orders
+    # Créer table orders (NOUVELLE VERSION POUR MULTI-PRODUITS)
     cursor.execute('''
     CREATE TABLE orders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id INTEGER NOT NULL,
+        order_number TEXT UNIQUE NOT NULL,
         customer_phone TEXT NOT NULL,
-        quantity INTEGER NOT NULL,
+        customer_email TEXT,
         total_price REAL NOT NULL,
         delivery_address TEXT NOT NULL,
         status TEXT DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # Créer table order_items
+    cursor.execute('''
+    CREATE TABLE order_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_price REAL NOT NULL,
+        FOREIGN KEY (order_id) REFERENCES orders (id),
         FOREIGN KEY (product_id) REFERENCES products (id)
     )
     ''')
@@ -166,9 +203,31 @@ def init_db():
             prod
         )
     
+    # Créer une commande de test
+    order_number = generate_order_number()
+    cursor.execute(
+        "INSERT INTO orders (order_number, customer_phone, customer_email, total_price, delivery_address, status) VALUES (?, ?, ?, ?, ?, ?)",
+        (order_number, "+213123456789", "test@example.com", 605.5, "123 Rue Test, Alger", "pending")
+    )
+    order_id = cursor.lastrowid
+    
+    # Ajouter des items à la commande test
+    cursor.execute("SELECT id, price FROM products LIMIT 2")
+    test_products = cursor.fetchall()
+    
+    if len(test_products) >= 2:
+        cursor.execute(
+            "INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)",
+            (order_id, test_products[0]['id'], 2, test_products[0]['price'])
+        )
+        cursor.execute(
+            "INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)",
+            (order_id, test_products[1]['id'], 1, test_products[1]['price'])
+        )
+    
     conn.commit()
     conn.close()
-    print("✅ Base de données initialisée avec rôles")
+    print("✅ Base de données initialisée avec commandes multi-produits")
 
 # Lancer l'initialisation
 init_db()
@@ -178,8 +237,8 @@ init_db()
 def home():
     return {
         "message": "Marketplace Alger API 🚀",
-        "version": "2.0",
-        "features": ["rôles utilisateurs", "dashboard shop", "commandes"],
+        "version": "3.0",
+        "features": ["rôles utilisateurs", "dashboard shop", "commandes multi-produits"],
         "endpoints": [
             "POST /register - S'inscrire (customer/shop/admin)",
             "POST /login - Se connecter",
@@ -188,8 +247,11 @@ def home():
             "POST /products - Créer produit (public)",
             "GET /shop/products - Produits d'un shop",
             "POST /shop/products - Créer produit (shop)",
-            "POST /orders - Créer commande",
-            "GET /orders/{phone} - Voir commandes"
+            "POST /orders - Créer commande (multi-produits)",
+            "GET /orders/{phone} - Voir commandes par téléphone",
+            "GET /orders/user/{email} - Voir commandes par email",
+            "GET /orders/shop/{owner_email} - Commandes d'un shop",
+            "PUT /orders/{order_id}/status - Mettre à jour le statut"
         ]
     }
 
@@ -485,70 +547,259 @@ def create_shop_product(product: ShopProductCreate, owner_email: str):
     finally:
         conn.close()
 
-# === COMMANDES ===
+# === COMMANDES (NOUVELLES ROUTES MULTI-PRODUITS) ===
 @app.post("/orders")
-def create_order(order: OrderCreate):
+def create_order(order: MultiOrderCreate):
+    """Créer une commande avec plusieurs produits"""
     conn = get_db()
     cursor = conn.cursor()
     
     try:
-        cursor.execute("SELECT id, name, price, stock FROM products WHERE id = ?", (order.product_id,))
-        product = row_to_dict(cursor.fetchone())
+        # Vérifier que tous les produits existent et ont du stock
+        total_price = 0
+        order_items = []
         
-        if not product:
-            raise HTTPException(404, "Produit non trouvé")
+        for item in order.items:
+            cursor.execute("SELECT id, name, price, stock, shop_id FROM products WHERE id = ?", (item.product_id,))
+            product = row_to_dict(cursor.fetchone())
+            
+            if not product:
+                raise HTTPException(404, f"Produit ID {item.product_id} non trouvé")
+            
+            if product['stock'] < item.quantity:
+                raise HTTPException(400, f"Stock insuffisant pour {product['name']}: {product['stock']} disponible")
+            
+            # Calculer le prix pour cet item
+            item_total = product['price'] * item.quantity
+            total_price += item_total
+            
+            # Préparer les données de l'item
+            order_items.append({
+                'product_id': product['id'],
+                'product_name': product['name'],
+                'shop_id': product['shop_id'],
+                'quantity': item.quantity,
+                'unit_price': product['price'],
+                'item_total': item_total
+            })
         
-        if product['stock'] < order.quantity:
-            raise HTTPException(400, f"Stock insuffisant: {product['stock']} disponible")
+        # Générer un numéro de commande unique
+        order_number = generate_order_number()
         
-        total = product['price'] * order.quantity
-        
+        # Créer la commande principale
         cursor.execute(
-            "INSERT INTO orders (product_id, customer_phone, quantity, total_price, delivery_address, status) VALUES (?, ?, ?, ?, ?, ?)",
-            (order.product_id, order.customer_phone, order.quantity, total, order.delivery_address, "pending")
+            """INSERT INTO orders (order_number, customer_phone, customer_email, total_price, 
+                                  delivery_address, status, notes) 
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (order_number, order.customer_phone, order.customer_email, total_price, 
+             order.delivery_address, "pending", order.notes)
         )
         order_id = cursor.lastrowid
         
-        # Mettre à jour stock
-        new_stock = product['stock'] - order.quantity
-        cursor.execute("UPDATE products SET stock = ? WHERE id = ?", (new_stock, order.product_id))
+        # Créer les items de commande et mettre à jour les stocks
+        for item in order_items:
+            cursor.execute(
+                "INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)",
+                (order_id, item['product_id'], item['quantity'], item['unit_price'])
+            )
+            
+            # Mettre à jour le stock du produit
+            cursor.execute(
+                "UPDATE products SET stock = stock - ? WHERE id = ?",
+                (item['quantity'], item['product_id'])
+            )
         
         conn.commit()
         
+        # Récupérer la commande créée avec ses items
         cursor.execute(
-            "SELECT o.*, p.name as product_name FROM orders o JOIN products p ON o.product_id = p.id WHERE o.id = ?",
+            """SELECT o.* FROM orders o WHERE o.id = ?""",
             (order_id,)
         )
         order_data = row_to_dict(cursor.fetchone())
         
+        # Récupérer les items de la commande
+        cursor.execute(
+            """SELECT oi.*, p.name as product_name, p.shop_id, s.name as shop_name 
+               FROM order_items oi 
+               JOIN products p ON oi.product_id = p.id 
+               JOIN shops s ON p.shop_id = s.id
+               WHERE oi.order_id = ?""",
+            (order_id,)
+        )
+        items = [row_to_dict(row) for row in cursor.fetchall()]
+        
+        order_data['items'] = items
+        
         return {
             "success": True,
-            "message": "Commande créée",
+            "message": "Commande créée avec succès",
             "order": order_data,
+            "order_number": order_number,
             "note": "Paiement à la livraison"
         }
         
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, f"Erreur lors de la création de la commande: {str(e)}")
     finally:
         conn.close()
 
 @app.get("/orders/{phone}")
-def get_orders(phone: str):
+def get_orders_by_phone(phone: str):
+    """Récupérer toutes les commandes d'un client par téléphone"""
     conn = get_db()
     cursor = conn.cursor()
     
     try:
         cursor.execute(
-            "SELECT o.*, p.name as product_name FROM orders o JOIN products p ON o.product_id = p.id WHERE o.customer_phone = ? ORDER BY o.created_at DESC",
+            "SELECT * FROM orders WHERE customer_phone = ? ORDER BY created_at DESC",
             (phone,)
         )
-        
         orders = [row_to_dict(row) for row in cursor.fetchall()]
+        
+        # Pour chaque commande, récupérer les items
+        for order in orders:
+            cursor.execute(
+                """SELECT oi.*, p.name as product_name 
+                   FROM order_items oi 
+                   JOIN products p ON oi.product_id = p.id 
+                   WHERE oi.order_id = ?""",
+                (order['id'],)
+            )
+            order['items'] = [row_to_dict(row) for row in cursor.fetchall()]
         
         return {
             "count": len(orders),
             "orders": orders
         }
         
+    finally:
+        conn.close()
+
+# NOUVELLE ROUTE : Commandes par email
+@app.get("/orders/user/{email}")
+def get_orders_by_email(email: str):
+    """Récupérer toutes les commandes d'un client par email"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(
+            "SELECT * FROM orders WHERE customer_email = ? ORDER BY created_at DESC",
+            (email,)
+        )
+        orders = [row_to_dict(row) for row in cursor.fetchall()]
+        
+        # Pour chaque commande, récupérer les items
+        for order in orders:
+            cursor.execute(
+                """SELECT oi.*, p.name as product_name 
+                   FROM order_items oi 
+                   JOIN products p ON oi.product_id = p.id 
+                   WHERE oi.order_id = ?""",
+                (order['id'],)
+            )
+            order['items'] = [row_to_dict(row) for row in cursor.fetchall()]
+        
+        return {
+            "count": len(orders),
+            "orders": orders
+        }
+        
+    finally:
+        conn.close()
+
+# NOUVELLE ROUTE : Commandes d'un shop
+@app.get("/orders/shop/{owner_email}")
+def get_shop_orders(owner_email: str):
+    """Récupérer toutes les commandes pour les produits d'un shop"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        # Trouver le shop de cet utilisateur
+        cursor.execute(
+            """SELECT s.id as shop_id 
+               FROM users u 
+               JOIN shops s ON u.id = s.owner_id 
+               WHERE u.email = ? AND u.role = 'shop'""",
+            (owner_email,)
+        )
+        shop = row_to_dict(cursor.fetchone())
+        
+        if not shop:
+            raise HTTPException(403, "Accès réservé aux fournisseurs")
+        
+        # Récupérer toutes les commandes qui contiennent des produits de ce shop
+        cursor.execute(
+            """SELECT DISTINCT o.* 
+               FROM orders o
+               JOIN order_items oi ON o.id = oi.order_id
+               JOIN products p ON oi.product_id = p.id
+               WHERE p.shop_id = ?
+               ORDER BY o.created_at DESC""",
+            (shop['shop_id'],)
+        )
+        orders = [row_to_dict(row) for row in cursor.fetchall()]
+        
+        # Pour chaque commande, récupérer les items (seulement ceux de ce shop)
+        for order in orders:
+            cursor.execute(
+                """SELECT oi.*, p.name as product_name, p.shop_id 
+                   FROM order_items oi 
+                   JOIN products p ON oi.product_id = p.id 
+                   WHERE oi.order_id = ? AND p.shop_id = ?""",
+                (order['id'], shop['shop_id'])
+            )
+            order['items'] = [row_to_dict(row) for row in cursor.fetchall()]
+        
+        return {
+            "shop_id": shop['shop_id'],
+            "count": len(orders),
+            "orders": orders
+        }
+        
+    finally:
+        conn.close()
+
+# NOUVELLE ROUTE : Mettre à jour le statut d'une commande
+@app.put("/orders/{order_id}/status")
+def update_order_status(order_id: int, status_update: OrderStatusUpdate):
+    """Mettre à jour le statut d'une commande"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        # Vérifier que la commande existe
+        cursor.execute("SELECT id FROM orders WHERE id = ?", (order_id,))
+        if not cursor.fetchone():
+            raise HTTPException(404, "Commande non trouvée")
+        
+        # Mettre à jour le statut
+        cursor.execute(
+            "UPDATE orders SET status = ? WHERE id = ?",
+            (status_update.status, order_id)
+        )
+        
+        conn.commit()
+        
+        # Récupérer la commande mise à jour
+        cursor.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
+        order = row_to_dict(cursor.fetchone())
+        
+        return {
+            "success": True,
+            "message": f"Statut de la commande mis à jour: {status_update.status}",
+            "order": order
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Erreur: {str(e)}")
     finally:
         conn.close()
 
@@ -593,11 +844,16 @@ def get_admin_stats():
         cursor.execute("SELECT SUM(total_price) as total_revenue FROM orders")
         total_revenue = cursor.fetchone()[0] or 0
         
+        # Commandes par statut
+        cursor.execute("SELECT status, COUNT(*) as count FROM orders GROUP BY status")
+        orders_by_status = [row_to_dict(row) for row in cursor.fetchall()]
+        
         return {
             "roles": roles_stats,
             "total_products": total_products,
             "total_orders": total_orders,
-            "total_revenue": total_revenue
+            "total_revenue": total_revenue,
+            "orders_by_status": orders_by_status
         }
     finally:
         conn.close()
@@ -605,7 +861,8 @@ def get_admin_stats():
 if __name__ == "__main__":
     print("🚀 Marketplace Alger API démarrée")
     print("📊 Système de rôles activé (customer/shop/admin)")
-    print("🏪 Dashboard shop disponible")
+    print("🛒 Commandes multi-produits disponibles")
+    print("🏪 Dashboard shop complet")
     print("🌐 API: http://localhost:8000")
     print("📚 Docs: http://localhost:8000/docs")
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
