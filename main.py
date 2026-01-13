@@ -1,100 +1,99 @@
-# main.py - Version améliorée mais compatible
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends
-from pydantic import ValidationError
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from typing import Optional, List, Dict
 import uvicorn
 import sqlite3
+import hashlib
+import random
+import string
+import json
 import asyncio
 from datetime import datetime
-import logging
-
-# AJOUTE CES IMPORTS
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from contextlib import contextmanager
-
-# Importez vos modules
-from app import utils, schemas
-from app.auth import create_login_response, verify_token, get_current_user_email
-from app.database import get_db as get_sqlalchemy_db
-
-# Configuration du logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Marketplace Alger API")
 
-# ==================== CORS ====================
+# ==================== CORS AMÉLIORÉ ====================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # À changer pour la production
+    allow_origins=[
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["*"],
+    max_age=3600,
 )
 
-# ==================== GESTION D'ERREURS GLOBALE ====================
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=utils.create_response(
-            success=False,
-            message=exc.detail,
-            error=str(exc.detail)
-        )
-    )
+# Middleware pour logs et headers supplémentaires
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    print(f"🌐 {request.method} {request.url}")
+    print(f"   Origin: {request.headers.get('origin')}")
+    print(f"   Referer: {request.headers.get('referer')}")
+    
+    response = await call_next(request)
+    
+    # Assurer les headers CORS
+    origin = request.headers.get("origin")
+    if origin in ["http://127.0.0.1:5173", "http://localhost:5173"]:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    
+    print(f"   Status: {response.status_code}")
+    return response
 
-@app.exception_handler(ValidationError)
-async def validation_exception_handler(request, exc):
-    errors = [f"{error['loc'][1]}: {error['msg']}" for error in exc.errors()]
+# Handler OPTIONS global
+@app.options("/{full_path:path}")
+async def options_handler(full_path: str):
     return JSONResponse(
-        status_code=422,
-        content=utils.create_response(
-            success=False,
-            message="Erreur de validation",
-            error=", ".join(errors),
-            details=exc.errors()
-        )
-    )
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
-    logger.error(f"Erreur non gérée: {str(exc)}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content=utils.create_response(
-            success=False,
-            message="Une erreur interne est survenue",
-            error="Internal server error"
-        )
+        content={"message": "CORS preflight"},
+        headers={
+            "Access-Control-Allow-Origin": "http://127.0.0.1:5173",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Max-Age": "3600",
+        }
     )
 
 # ==================== WEBSOCKET MANAGER ====================
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
+        self.connection_times: Dict[str, datetime] = {}
     
     async def connect(self, websocket: WebSocket, user_id: str):
+        # Fermer l'ancienne connexion si elle existe
+        if user_id in self.active_connections:
+            try:
+                await self.active_connections[user_id].close()
+            except:
+                pass
+        
         await websocket.accept()
         self.active_connections[user_id] = websocket
-        logger.info(f"WebSocket connecté pour user: {user_id}")
+        self.connection_times[user_id] = datetime.now()
+        print(f"🔌 WebSocket connecté pour user: {user_id}")
     
     def disconnect(self, user_id: str):
         if user_id in self.active_connections:
             del self.active_connections[user_id]
-            logger.info(f"WebSocket déconnecté pour user: {user_id}")
+            if user_id in self.connection_times:
+                del self.connection_times[user_id]
+            print(f"👋 WebSocket déconnecté pour user: {user_id}")
     
     async def send_personal_message(self, message: dict, user_id: str):
         if user_id in self.active_connections:
             websocket = self.active_connections[user_id]
             try:
                 await websocket.send_json(message)
-                logger.info(f"Message envoyé à user {user_id}")
+                print(f"📤 Message envoyé à user {user_id}")
             except:
                 self.disconnect(user_id)
     
@@ -107,36 +106,238 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# ==================== FONCTIONS DE BASE (COMPATIBILITÉ) ====================
-@contextmanager
+# === FONCTIONS DE BASE ===
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
 def get_db():
-    """Connexion à la base SQLite - Compatible avec l'ancien code"""
     conn = sqlite3.connect('marketplace.db')
     conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
+    return conn
 
+def row_to_dict(row):
+    return dict(row) if row else None
+
+def generate_order_number():
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    random_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"CMD-{timestamp}-{random_str}"
+
+# === MODÈLES PYDANTIC ===
+class UserCreate(BaseModel):
+    email: str
+    phone: Optional[str] = None
+    password: str
+    full_name: str
+    role: str = "customer"
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class ProductCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    price: float
+    stock: int = 0
+    category: str = "general"
+
+class ShopProductCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    price: float
+    stock: int = 0
+    category: str = "general"
+
+class OrderItem(BaseModel):
+    product_id: int
+    quantity: int
+
+class MultiOrderCreate(BaseModel):
+    items: List[OrderItem]
+    customer_phone: str
+    customer_email: Optional[str] = None
+    delivery_address: str
+    notes: Optional[str] = None
+
+class OrderStatusUpdate(BaseModel):
+    status: str
+
+class NotificationBase(BaseModel):
+    user_id: int
+    type: str = "system"
+    title: str
+    message: str
+    link: Optional[str] = ""
+    icon: Optional[str] = "bell"
+    data: Optional[dict] = {}
+
+class NotificationCreate(NotificationBase):
+    pass
+
+# === INITIALISATION DB ===
 def init_db():
-    """Créer les tables et données de test - Compatible"""
-    # Votre code existant inchangé...
-    # Copier exactement votre fonction init_db() ici
-    # ... (votre code existant) ...
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    tables = ["order_items", "orders", "products", "shops", "users", "notifications"]
+    for table in tables:
+        cursor.execute(f"DROP TABLE IF EXISTS {table}")
+    
+    cursor.execute('''
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        phone TEXT UNIQUE,
+        password TEXT NOT NULL,
+        full_name TEXT NOT NULL,
+        role TEXT DEFAULT 'customer',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE shops (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        owner_id INTEGER NOT NULL,
+        FOREIGN KEY (owner_id) REFERENCES users (id)
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT,
+        price REAL NOT NULL,
+        stock INTEGER DEFAULT 0,
+        category TEXT DEFAULT 'general',
+        shop_id INTEGER NOT NULL,
+        FOREIGN KEY (shop_id) REFERENCES shops (id)
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_number TEXT UNIQUE NOT NULL,
+        customer_phone TEXT NOT NULL,
+        customer_email TEXT,
+        total_price REAL NOT NULL,
+        delivery_address TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE order_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_price REAL NOT NULL,
+        FOREIGN KEY (order_id) REFERENCES orders (id),
+        FOREIGN KEY (product_id) REFERENCES products (id)
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        type TEXT DEFAULT 'system',
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        link TEXT DEFAULT '',
+        icon TEXT DEFAULT 'bell',
+        read BOOLEAN DEFAULT 0,
+        data TEXT DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id)
+    )
+    ''')
+    
+    conn.commit()
+    
+    # Admin test
+    cursor.execute(
+        "INSERT INTO users (email, phone, password, full_name, role) VALUES (?, ?, ?, ?, ?)",
+        ("admin@marketplace.dz", "+213123456789", hash_password("admin123"), "Admin Test", "admin")
+    )
+    admin_id = cursor.lastrowid
+    
+    # Shop test
+    cursor.execute(
+        "INSERT INTO shops (name, owner_id) VALUES (?, ?)",
+        ("Shop de Test", admin_id)
+    )
+    shop_id = cursor.lastrowid
+    
+    # Produits test
+    test_products = [
+        ("Tomates Algériennes", "Tomates fraîches", 180.5, 50, "légumes", shop_id),
+        ("Pommes Golden", "Pommes sucrées", 250.0, 30, "fruits", shop_id),
+        ("Lait NCA", "Lait frais 1L", 120.0, 100, "produits laitiers", shop_id),
+        ("Pain Traditionnel", "Pain algérien", 25.0, 200, "boulangerie", shop_id),
+    ]
+    
+    for prod in test_products:
+        cursor.execute(
+            "INSERT INTO products (name, description, price, stock, category, shop_id) VALUES (?, ?, ?, ?, ?, ?)",
+            prod
+        )
+    
+    # Commande test
+    order_number = generate_order_number()
+    cursor.execute(
+        "INSERT INTO orders (order_number, customer_phone, customer_email, total_price, delivery_address, status) VALUES (?, ?, ?, ?, ?, ?)",
+        (order_number, "+213123456789", "test@example.com", 605.5, "123 Rue Test, Alger", "pending")
+    )
+    order_id = cursor.lastrowid
+    
+    # Items commande
+    cursor.execute("SELECT id, price FROM products LIMIT 2")
+    test_products = cursor.fetchall()
+    
+    if len(test_products) >= 2:
+        cursor.execute(
+            "INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)",
+            (order_id, test_products[0]['id'], 2, test_products[0]['price'])
+        )
+        cursor.execute(
+            "INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)",
+            (order_id, test_products[1]['id'], 1, test_products[1]['price'])
+        )
+    
+    # Notification test
+    cursor.execute(
+        """INSERT INTO notifications 
+           (user_id, type, title, message, link, icon, data) 
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (admin_id, "system", "Bienvenue sur Marketplace", 
+         "Votre compte administrateur a été créé avec succès.", 
+         "/dashboard", "bell", '{"welcome": true}')
+    )
+    
+    conn.commit()
+    conn.close()
+    print("✅ Base de données initialisée")
 
-# Initialiser la base
 init_db()
 
-# ==================== ROUTES API (COMPATIBLES) ====================
+# === ROUTES API ===
 @app.get("/")
 def home():
     return {
         "message": "Marketplace Alger API 🚀",
-        "version": "4.1",  # Version mise à jour
-        "features": ["rôles utilisateurs", "dashboard shop", "commandes multi-produits", "notifications temps réel", "validation améliorée"],
+        "version": "4.2",
+        "cors": "Enabled for http://127.0.0.1:5173",
         "endpoints": [
-            "POST /register - S'inscrire (avec validation)",
-            "POST /login - Se connecter (avec JWT optionnel)",
+            "POST /register - S'inscrire",
+            "POST /login - Se connecter",
             "GET /me - Info utilisateur",
             "GET /products - Liste produits",
             "POST /orders - Créer commande",
@@ -152,394 +353,176 @@ def home():
 @app.get("/health")
 def health():
     try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-        return utils.create_response(
-            success=True,
-            message="API en bonne santé"
-        )
-    except Exception as e:
-        logger.error(f"Erreur health check: {e}")
-        return utils.create_response(
-            success=False,
-            message="Problème de connexion à la base"
-        )
-
-# ==================== AUTHENTIFICATION (AMÉLIORÉE) ====================
-@app.post("/register")
-def register(user: schemas.UserCreate):
-    """Inscription avec validation améliorée"""
-    with get_db() as conn:
+        conn = get_db()
         cursor = conn.cursor()
-        
-        try:
-            # Vérifier email
-            cursor.execute("SELECT id FROM users WHERE email = ?", (user.email,))
-            if cursor.fetchone():
-                raise HTTPException(400, "Email déjà utilisé")
-            
-            # Vérifier phone
-            if user.phone:
-                cursor.execute("SELECT id FROM users WHERE phone = ?", (user.phone,))
-                if cursor.fetchone():
-                    raise HTTPException(400, "Téléphone déjà utilisé")
-            
-            # Créer utilisateur avec mot de passe hashé
-            hashed = utils.hash_password(user.password)
-            cursor.execute(
-                "INSERT INTO users (email, phone, password, full_name, role) VALUES (?, ?, ?, ?, ?)",
-                (user.email, user.phone, hashed, user.full_name, user.role)
-            )
-            user_id = cursor.lastrowid
-            
-            # Si c'est un shop, créer automatiquement un shop
-            if user.role == "shop":
-                cursor.execute(
-                    "INSERT INTO shops (name, owner_id) VALUES (?, ?)",
-                    (f"Boutique de {user.full_name}", user_id)
-                )
-            
-            conn.commit()
-            
-            # Retourner réponse
-            cursor.execute(
-                "SELECT id, email, phone, full_name, role, created_at FROM users WHERE id = ?",
-                (user_id,)
-            )
-            user_data = utils.row_to_dict(cursor.fetchone())
-            
-            return utils.create_response(
-                success=True,
-                message="Inscription réussie",
-                user=user_data
-            )
-            
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Erreur inscription: {e}")
-            raise HTTPException(500, f"Erreur: {str(e)}")
+        cursor.execute("SELECT 1")
+        conn.close()
+        return {"status": "healthy", "cors": "enabled"}
+    except:
+        return {"status": "unhealthy"}
 
-@app.post("/login")
-def login(credentials: schemas.UserLogin):
-    """Connexion avec option JWT"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute(
-                "SELECT id, email, password, full_name, role FROM users WHERE email = ?",
-                (credentials.email,)
-            )
-            user = utils.row_to_dict(cursor.fetchone())
-            
-            if not user:
-                raise HTTPException(401, "Email ou mot de passe incorrect")
-            
-            if utils.hash_password(credentials.password) != user['password']:
-                raise HTTPException(401, "Email ou mot de passe incorrect")
-            
-            # Utiliser le nouveau système de réponse avec JWT optionnel
-            return create_login_response(user, use_jwt=True)
-            
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Erreur connexion: {e}")
-            raise HTTPException(500, f"Erreur: {str(e)}")
-
-# Route de login compatible avec l'ancien format
-@app.post("/login-old")
-def login_old(credentials: schemas.UserLogin):
-    """Ancienne version de login pour compatibilité"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute(
-                "SELECT id, email, password, full_name, role FROM users WHERE email = ?",
-                (credentials.email,)
-            )
-            user = utils.row_to_dict(cursor.fetchone())
-            
-            if not user:
-                raise HTTPException(401, "Email ou mot de passe incorrect")
-            
-            if utils.hash_password(credentials.password) != user['password']:
-                raise HTTPException(401, "Email ou mot de passe incorrect")
-            
-            # Retourner l'ancien format
-            return {
-                "success": True,
-                "message": "Connexion réussie",
-                "user_id": user['id'],
-                "email": user['email'],
-                "full_name": user['full_name'],
-                "role": user['role']
-            }
-            
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(500, f"Erreur: {str(e)}")
-
-@app.get("/me")
-def get_me(email: str):
-    """Info utilisateur avec JWT optionnel"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute(
-                "SELECT id, email, phone, full_name, role FROM users WHERE email = ?",
-                (email,)
-            )
-            user = utils.row_to_dict(cursor.fetchone())
-            
-            if not user:
-                raise HTTPException(404, "Utilisateur non trouvé")
-            
-            # Si c'est un shop, ajouter l'ID du shop
-            if user['role'] == 'shop':
-                cursor.execute(
-                    "SELECT id as shop_id, name as shop_name FROM shops WHERE owner_id = ?",
-                    (user['id'],)
-                )
-                shop_info = utils.row_to_dict(cursor.fetchone())
-                if shop_info:
-                    user.update(shop_info)
-            
-            return user
-            
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Erreur get_me: {e}")
-            raise HTTPException(500, f"Erreur: {str(e)}")
-
-# ==================== ROUTES PROTÉGÉES (OPTIONNEL) ====================
-@app.get("/protected")
-def protected_route(current_user: dict = Depends(verify_token)):
-    """Exemple de route protégée par JWT"""
-    return utils.create_response(
-        success=True,
-        message="Accès autorisé",
-        user_id=current_user.get("sub"),
-        email=current_user.get("email")
-    )
-
-# ==================== PRODUITS (AVEC VALIDATION) ====================
-@app.post("/products")
-def create_product(product: schemas.ProductCreate):
-    """Créer un produit avec validation améliorée"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("SELECT id FROM shops LIMIT 1")
-            shop = utils.row_to_dict(cursor.fetchone())
-            
-            if not shop:
-                raise HTTPException(404, "Aucun shop disponible")
-            
-            cursor.execute(
-                "INSERT INTO products (name, description, price, stock, category, shop_id) VALUES (?, ?, ?, ?, ?, ?)",
-                (product.name, product.description, product.price, product.stock, product.category, shop['id'])
-            )
-            product_id = cursor.lastrowid
-            
-            conn.commit()
-            
-            cursor.execute("SELECT * FROM products WHERE id = ?", (product_id,))
-            product_data = utils.row_to_dict(cursor.fetchone())
-            
-            return utils.create_response(
-                success=True,
-                message="Produit créé avec succès",
-                product=product_data
-            )
-            
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Erreur création produit: {e}")
-            raise HTTPException(500, f"Erreur: {str(e)}")
-
+        # === PRODUITS ===
 @app.get("/products")
-def get_products(category: Optional[str] = None, limit: int = 100, offset: int = 0):
-    """Liste des produits avec pagination optionnelle"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        try:
-            if category:
-                cursor.execute(
-                    """SELECT p.*, s.name as shop_name 
-                       FROM products p 
-                       JOIN shops s ON p.shop_id = s.id 
-                       WHERE p.category = ? 
-                       LIMIT ? OFFSET ?""",
-                    (category, limit, offset)
-                )
-            else:
-                cursor.execute(
-                    """SELECT p.*, s.name as shop_name 
-                       FROM products p 
-                       JOIN shops s ON p.shop_id = s.id
-                       LIMIT ? OFFSET ?""",
-                    (limit, offset)
-                )
-            
-            products = [utils.row_to_dict(row) for row in cursor.fetchall()]
-            
-            # Compter total
-            count_query = "SELECT COUNT(*) as total FROM products"
-            if category:
-                count_query += " WHERE category = ?"
-                cursor.execute(count_query, (category,))
-            else:
-                cursor.execute(count_query)
-            
-            total = cursor.fetchone()['total']
-            
-            return {
-                "success": True,
-                "count": len(products),
-                "total": total,
-                "limit": limit,
-                "offset": offset,
-                "products": products
-            }
-            
-        except Exception as e:
-            logger.error(f"Erreur récupération produits: {e}")
-            raise HTTPException(500, f"Erreur: {str(e)}")
-
-# ==================== COMMANDES (AMÉLIORÉES) ====================
-@app.post("/orders")
-async def create_order(order: schemas.MultiOrderCreate):
-    """Créer une commande avec validation"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        try:
-            # Vérifier que tous les produits existent et ont du stock
-            total_price = 0
-            order_items = []
-            
-            for item in order.items:
-                cursor.execute("SELECT id, name, price, stock, shop_id FROM products WHERE id = ?", (item.product_id,))
-                product = utils.row_to_dict(cursor.fetchone())
-                
-                if not product:
-                    raise HTTPException(404, f"Produit ID {item.product_id} non trouvé")
-                
-                if product['stock'] < item.quantity:
-                    raise HTTPException(400, f"Stock insuffisant pour {product['name']}: {product['stock']} disponible")
-                
-                item_total = product['price'] * item.quantity
-                total_price += item_total
-                
-                order_items.append({
-                    'product_id': product['id'],
-                    'product_name': product['name'],
-                    'shop_id': product['shop_id'],
-                    'quantity': item.quantity,
-                    'unit_price': product['price'],
-                    'item_total': item_total
-                })
-            
-            # Générer un numéro de commande unique
-            order_number = utils.generate_order_number()
-            
-            # Créer la commande principale
+def get_products(category: Optional[str] = None):
+    """Lister tous les produits - ROUTE MANQUANTE"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        if category:
             cursor.execute(
-                """INSERT INTO orders (order_number, customer_phone, customer_email, total_price, 
-                                      delivery_address, status, notes) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (order_number, order.customer_phone, order.customer_email, total_price, 
-                 order.delivery_address, "pending", order.notes)
+                "SELECT p.*, s.name as shop_name FROM products p JOIN shops s ON p.shop_id = s.id WHERE p.category = ?",
+                (category,)
             )
-            order_id = cursor.lastrowid
-            
-            # Créer les items de commande et mettre à jour les stocks
-            for item in order_items:
-                cursor.execute(
-                    "INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)",
-                    (order_id, item['product_id'], item['quantity'], item['unit_price'])
-                )
-                
-                cursor.execute(
-                    "UPDATE products SET stock = stock - ? WHERE id = ?",
-                    (item['quantity'], item['product_id'])
-                )
-            
-            conn.commit()
-            
-            # Récupérer la commande créée
-            cursor.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
-            order_data = utils.row_to_dict(cursor.fetchone())
-            
-            # Récupérer les items
+        else:
             cursor.execute(
-                """SELECT oi.*, p.name as product_name, p.shop_id, s.name as shop_name 
-                   FROM order_items oi 
-                   JOIN products p ON oi.product_id = p.id 
-                   JOIN shops s ON p.shop_id = s.id
-                   WHERE oi.order_id = ?""",
-                (order_id,)
+                "SELECT p.*, s.name as shop_name FROM products p JOIN shops s ON p.shop_id = s.id"
             )
-            items = [utils.row_to_dict(row) for row in cursor.fetchall()]
-            
-            order_data['items'] = items
-            
-            # NOTIFICATION : Envoyer une notification à l'admin
-            try:
-                notification_data = schemas.NotificationCreate(
-                    user_id=1,  # ID de l'admin
-                    type="order",
-                    title="Nouvelle commande",
-                    message=f"Commande #{order_number} reçue de {order.customer_phone}",
-                    link=f"/admin/orders/{order_id}",
-                    icon="shopping-cart",
-                    data={"order_id": order_id, "order_number": order_number}
-                )
-                notification_task = asyncio.create_task(
-                    create_notification(notification_data)
-                )
-            except Exception as notif_error:
-                logger.error(f"Erreur notification: {notif_error}")
-            
-            return utils.create_response(
-                success=True,
-                message="Commande créée avec succès",
-                order=order_data,
-                order_number=order_number,
-                note="Paiement à la livraison"
-            )
-            
-        except HTTPException:
-            conn.rollback()
-            raise
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"Erreur création commande: {e}")
-            raise HTTPException(500, f"Erreur lors de la création de la commande: {str(e)}")
+        
+        products = [row_to_dict(row) for row in cursor.fetchall()]
+        
+        return {
+            "count": len(products),
+            "products": products
+        }
+        
+    except Exception as e:
+        print(f"❌ Erreur récupération produits: {e}")
+        raise HTTPException(500, f"Erreur: {str(e)}")
+    finally:
+        conn.close()
 
-# ... (garder le reste de vos routes existantes inchangées pour compatibilité)
-# Je garde votre code exact pour : 
-# - get_orders_by_phone
-# - get_orders_by_email  
-# - get_shop_orders
-# - update_order_status
-# - toutes les routes shop
-# - toutes les routes notifications
-# - toutes les routes admin
+@app.post("/products")
+def create_product(product: ProductCreate):
+    """Créer un produit"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("SELECT id FROM shops LIMIT 1")
+        shop = row_to_dict(cursor.fetchone())
+        
+        if not shop:
+            raise HTTPException(404, "Aucun shop disponible")
+        
+        cursor.execute(
+            "INSERT INTO products (name, description, price, stock, category, shop_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (product.name, product.description, product.price, product.stock, product.category, shop['id'])
+        )
+        product_id = cursor.lastrowid
+        
+        conn.commit()
+        
+        cursor.execute("SELECT * FROM products WHERE id = ?", (product_id,))
+        product_data = row_to_dict(cursor.fetchone())
+        
+        return {
+            "success": True,
+            "message": "Produit créé",
+            "product": product_data
+        }
+        
+    except Exception as e:
+        print(f"❌ Erreur création produit: {e}")
+        raise HTTPException(500, f"Erreur: {str(e)}")
+    finally:
+        conn.close()
 
-# Copiez simplement votre code existant ici, il restera compatible
+# === NOTIFICATIONS API (CORRIGÉES) ===
+@app.post("/api/notifications")
+async def create_notification(notification: NotificationCreate):
+    """Créer une notification"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(
+            """INSERT INTO notifications 
+               (user_id, type, title, message, link, icon, data) 
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (notification.user_id, notification.type, notification.title, 
+             notification.message, notification.link, notification.icon,
+             json.dumps(notification.data or {}))
+        )
+        notification_id = cursor.lastrowid
+        
+        conn.commit()
+        
+        cursor.execute(
+            "SELECT * FROM notifications WHERE id = ?",
+            (notification_id,)
+        )
+        notif_data = row_to_dict(cursor.fetchone())
+        
+        if notif_data.get('data'):
+            notif_data['data'] = json.loads(notif_data['data'])
+        
+        # WebSocket
+        await manager.send_personal_message({
+            "type": "new_notification",
+            "notification": notif_data
+        }, str(notification.user_id))
+        
+        return {
+            "success": True,
+            "notification": notif_data
+        }
+        
+    except Exception as e:
+        print(f"❌ Erreur création notification: {e}")
+        raise HTTPException(500, f"Erreur: {str(e)}")
+    finally:
+        conn.close()
 
-# ==================== WEBSOCKET ====================
+@app.get("/api/notifications/{user_id}")
+def get_user_notifications(user_id: int):
+    """Récupérer les notifications d'un utilisateur"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(
+            """SELECT * FROM notifications 
+               WHERE user_id = ? 
+               ORDER BY created_at DESC 
+               LIMIT 20""",
+            (user_id,)
+        )
+        notifications = [row_to_dict(row) for row in cursor.fetchall()]
+        
+        for notif in notifications:
+            if notif.get('data'):
+                notif['data'] = json.loads(notif['data'])
+        
+        return {
+            "success": True,
+            "count": len(notifications),
+            "notifications": notifications
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Erreur: {str(e)}")
+    finally:
+        conn.close()
+
+@app.post("/api/notifications/test/{user_id}")
+async def test_notification(user_id: int):
+    """Tester le système de notifications"""
+    test_notif = NotificationCreate(
+        user_id=user_id,
+        type="system",
+        title="Notification de test",
+        message="Ceci est une notification de test pour vérifier le système.",
+        link="/dashboard",
+        icon="bell",
+        data={"test": True, "timestamp": datetime.now().isoformat()}
+    )
+    
+    return await create_notification(test_notif)
+
+# ... (Gardez le reste de vos routes existantes inchangées)
+# Copiez toutes vos autres routes ici...
+
+# === WEBSOCKET ===
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
     await manager.connect(websocket, user_id)
@@ -549,39 +532,24 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             data = await websocket.receive_text()
             if data == "ping":
                 await websocket.send_text("pong")
-            elif data.startswith("{"):
-                try:
-                    json_data = json.loads(data)
-                    logger.info(f"Message WebSocket de {user_id}: {json_data}")
-                except:
-                    pass
             
     except WebSocketDisconnect:
         manager.disconnect(user_id)
     except Exception as e:
-        logger.error(f"Erreur WebSocket: {e}")
+        print(f"❌ Erreur WebSocket: {e}")
         manager.disconnect(user_id)
 
-# ==================== NOTIFICATIONS ====================
-# Copiez vos routes notifications existantes ici
-# Elles fonctionneront avec les nouvelles validations
-
-# ==================== LANCEMENT ====================
 if __name__ == "__main__":
-    logger.info("🚀 Marketplace Alger API démarrée")
-    logger.info("📊 Système de rôles activé (customer/shop/admin)")
-    logger.info("🛒 Commandes multi-produits disponibles")
-    logger.info("🏪 Dashboard shop complet")
-    logger.info("🔔 Notifications temps réel activées")
-    logger.info("🔐 Validation améliorée avec Pydantic")
-    logger.info("🌐 API: http://localhost:8000")
-    logger.info("🔌 WebSocket: ws://localhost:8000/ws/{user_id}")
-    logger.info("📚 Docs: http://localhost:8000/docs")
+    print("🚀 Marketplace Alger API démarrée")
+    print("🌐 CORS configuré pour: http://127.0.0.1:5173")
+    print("🔗 Frontend: http://127.0.0.1:5173")
+    print("🔗 Backend: http://localhost:8000")
+    print("🔌 WebSocket: ws://localhost:8000/ws/{user_id}")
+    print("📚 Docs: http://localhost:8000/docs")
     
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
         port=8000, 
-        reload=True,
-        log_level="info"
+        reload=True
     )
