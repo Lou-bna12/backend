@@ -14,6 +14,18 @@ enum Role {
   ADMIN
 }
 
+enum SupplierStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum SupplierType {
+  SUPERETTE
+  MAGASIN
+  RESTAURANT
+}
+
 model User {
   id        Int      @id @default(autoincrement())
   name      String
@@ -21,4 +33,70 @@ model User {
   password  String
   role      Role     @default(CLIENT)
   createdAt DateTime @default(now())
+
+  supplier  Supplier?
+  orders    Order[]
+
+}
+
+model Supplier {
+  id          Int             @id @default(autoincrement())
+  userId      Int             @unique
+  companyName String
+  type        SupplierType
+  nif         String
+  nrc         String
+  address     String
+  status      SupplierStatus  @default(PENDING)
+  createdAt   DateTime        @default(now())
+
+  user        User            @relation(fields: [userId], references: [id])
+  products    Product[]
+  orders    Order[]
+}
+
+model Product {
+  id          Int      @id @default(autoincrement())
+  supplierId  Int
+  name        String
+  description String?
+  price       Float
+  stock       Int
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  supplier    Supplier @relation(fields: [supplierId], references: [id])
+  orderItems  OrderItem[]
+}
+
+
+enum OrderStatus {
+  CREATED
+  PREPARING
+  READY
+  IN_DELIVERY
+  DELIVERED
+}
+
+model Order {
+  id         Int         @id @default(autoincrement())
+  clientId   Int
+  supplierId Int
+  status     OrderStatus @default(CREATED)
+  createdAt  DateTime    @default(now())
+
+  client     User        @relation(fields: [clientId], references: [id])
+  supplier   Supplier    @relation(fields: [supplierId], references: [id])
+  items      OrderItem[]
+}
+
+model OrderItem {
+  id        Int     @id @default(autoincrement())
+  orderId   Int
+  productId Int
+  quantity  Int
+  price     Float
+
+  order     Order   @relation(fields: [orderId], references: [id])
+  product   Product @relation(fields: [productId], references: [id])
 }
