@@ -1,41 +1,35 @@
 import prisma from "../prisma.js";
 
 /**
- * 👤 Profil du fournisseur connecté
+ * GET /api/suppliers/me
  */
 export const getMySupplierProfile = async (req, res) => {
-  const userId = req.user.userId;
-
   try {
-    const supplier = await prisma.supplier.findUnique({
+    const userId = req.user.userId;
+
+    const supplier = await prisma.supplier.findFirst({
       where: { userId },
-      include: {
-        user: {
-          select: {
-            id: true,
-            email: true,
-          },
-        },
-      },
     });
 
     if (!supplier) {
-      return res.status(404).json({ message: "Fournisseur introuvable" });
+      return res
+        .status(404)
+        .json({ message: "Fournisseur non trouvé pour cet utilisateur" });
     }
 
     res.json(supplier);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ message: "Erreur fournisseur" });
+    res.status(500).json({ message: "Erreur serveur" });
   }
 };
 
 /**
- * 🔄 Mise à jour du statut d’une commande par le fournisseur
+ * PUT /api/suppliers/orders/:id/status
  */
 export const updateOrderStatus = async (req, res) => {
   const userId = req.user.userId;
-  const orderId = Number(req.params.id);
+  const { id } = req.params;
   const { status } = req.body;
 
   if (!status) {
@@ -43,33 +37,38 @@ export const updateOrderStatus = async (req, res) => {
   }
 
   try {
-    const supplier = await prisma.supplier.findUnique({
+    // 1️⃣ Récupérer le supplier lié au user
+    const supplier = await prisma.supplier.findFirst({
       where: { userId },
     });
 
     if (!supplier) {
-      return res.status(403).json({ message: "Fournisseur introuvable" });
+      return res.status(403).json({ message: "Fournisseur non autorisé" });
     }
 
-    const order = await prisma.order.findFirst({
-      where: {
-        id: orderId,
-        supplierId: supplier.id,
-      },
+    // 2️⃣ Récupérer la commande
+    const order = await prisma.order.findUnique({
+      where: { id: Number(id) },
     });
 
     if (!order) {
       return res.status(404).json({ message: "Commande introuvable" });
     }
 
+    // 3️⃣ Vérifier que la commande appartient à ce fournisseur
+    if (order.supplierId !== supplier.id) {
+      return res.status(403).json({ message: "Accès interdit" });
+    }
+
+    // 4️⃣ Mise à jour du statut
     const updatedOrder = await prisma.order.update({
-      where: { id: orderId },
+      where: { id: Number(id) },
       data: { status },
     });
 
     res.json(updatedOrder);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ message: "Erreur mise à jour commande" });
+    res.status(500).json({ message: "Erreur serveur" });
   }
 };
