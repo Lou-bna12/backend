@@ -1,66 +1,98 @@
 import prisma from "../prisma.js";
 
-/**
- * 🔐 Création d’un produit (fournisseur connecté)
- */
 export const createProduct = async (req, res) => {
-  const userId = req.user.userId;
-  const { name, description, price, stock } = req.body;
-
-  if (!name || !price || stock === undefined) {
-    return res.status(400).json({ message: "Données produit invalides" });
-  }
-
   try {
-    // 🔎 Trouver le supplier lié à l'utilisateur
-    const supplier = await prisma.supplier.findUnique({
+    const userId = req.user.id;
+
+    // Vérifier que l'utilisateur est fournisseur
+    const supplier = await prisma.supplier.findFirst({
       where: { userId },
     });
 
     if (!supplier) {
-      return res.status(403).json({ message: "Fournisseur introuvable" });
+      return res.status(403).json({
+        message: "Profil fournisseur requis pour créer un produit",
+      });
+    }
+
+    const { name, price, stock } = req.body;
+
+    // Champs obligatoires EXACTS selon Prisma
+    if (!name || price === undefined || stock === undefined) {
+      return res.status(400).json({
+        message: "Champs obligatoires manquants",
+      });
     }
 
     const product = await prisma.product.create({
       data: {
         name,
-        description,
         price,
         stock,
-        isActive: true,
         supplierId: supplier.id,
       },
     });
 
     res.status(201).json(product);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: "Erreur création produit" });
+    console.error("CREATE PRODUCT ERROR:", error);
+    res.status(500).json({ message: "Erreur serveur" });
   }
 };
 
+
 /**
- * 📦 Récupérer les produits du fournisseur connecté
+ * GET /api/products/me
+ * Récupérer les produits du fournisseur connecté
  */
 export const getMyProducts = async (req, res) => {
-  const userId = req.user.userId;
-
   try {
-    const supplier = await prisma.supplier.findUnique({
+    const userId = req.user.id;
+
+    const supplier = await prisma.supplier.findFirst({
       where: { userId },
     });
 
     if (!supplier) {
-      return res.status(403).json({ message: "Fournisseur introuvable" });
+      return res.status(403).json({
+        message: "Profil fournisseur requis",
+      });
     }
 
     const products = await prisma.product.findMany({
       where: { supplierId: supplier.id },
+      orderBy: { id: "desc" },
     });
 
     res.json(products);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: "Erreur récupération produits" });
+    console.error("GET MY PRODUCTS ERROR:", error);
+    res.status(500).json({ message: "Erreur serveur" });
   }
 };
+
+/**
+ * GET /api/products
+ * Récupérer tous les produits actifs (public)
+ */
+export const getAllProducts = async (req, res) => {
+  try {
+    const products = await prisma.product.findMany({
+      where: { isActive: true },
+      orderBy: { id: "desc" },
+      include: {
+        supplier: {
+          select: {
+            companyName: true,
+          },
+        },
+      },
+    });
+
+    res.json(products);
+  } catch (error) {
+    console.error("GET ALL PRODUCTS ERROR:", error);
+    res.status(500).json({ message: "Erreur serveur" });
+  }
+};
+

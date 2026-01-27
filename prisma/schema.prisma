@@ -33,22 +33,33 @@ enum OrderItemStatus {
 }
 
 model User {
-  id       Int    @id @default(autoincrement())
-  email    String @unique
-  password String
-  role     Role
+  id        Int       @id @default(autoincrement())
+  email     String    @unique
+  password  String
 
-  orders   Order[]
+  supplier  Supplier?
 }
+
 
 model Supplier {
-  id         Int      @id @default(autoincrement())
-  name       String
-  status     SupplierStatus
+  id              Int      @id @default(autoincrement())
 
-  products   Product[]
-  orderItems OrderItem[]
+  companyName     String
+  nif             String
+  nrc             String
+  companyAddress  String
+  contactName     String
+  contactPhone    String
+
+  status          SupplierStatus @default(PENDING)
+
+  userId          Int      @unique
+  user            User     @relation(fields: [userId], references: [id])
+
+  products        Product[]
+  orderItems      OrderItem[]
 }
+
 
 model Product {
   id          Int      @id @default(autoincrement())

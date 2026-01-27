@@ -2,11 +2,15 @@ import prisma from "../prisma.js";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 
+// ==========================
+// REGISTER
+// ==========================
 export const register = async (req, res) => {
   try {
-    const { name, email, password, role } = req.body;
+    const { email, password, role } = req.body;
 
-    if (!name || !email || !password) {
+    // ✅ champs réellement nécessaires
+    if (!email || !password) {
       return res.status(400).json({ message: "Champs manquants" });
     }
 
@@ -22,10 +26,9 @@ export const register = async (req, res) => {
 
     const user = await prisma.user.create({
       data: {
-        name,
         email,
         password: hashedPassword,
-        role: role || "CLIENT",
+        role: role || "USER", // ⚠️ USER (pas CLIENT)
       },
     });
 
@@ -38,14 +41,21 @@ export const register = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error(error);
+    console.error("REGISTER ERROR:", error);
     res.status(500).json({ message: "Erreur serveur" });
   }
 };
 
+// ==========================
+// LOGIN
+// ==========================
 export const login = async (req, res) => {
   try {
     const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ message: "Champs manquants" });
+    }
 
     const user = await prisma.user.findUnique({
       where: { email },
@@ -63,7 +73,7 @@ export const login = async (req, res) => {
 
     const token = jwt.sign(
       {
-        userId: user.id,
+        id: user.id,       // ⚠️ cohérent avec middleware
         role: user.role,
       },
       process.env.JWT_SECRET,
@@ -80,7 +90,7 @@ export const login = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error(error);
+    console.error("LOGIN ERROR:", error);
     res.status(500).json({ message: "Erreur serveur" });
   }
 };

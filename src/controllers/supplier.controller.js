@@ -2,10 +2,11 @@ import prisma from "../prisma.js";
 
 /**
  * GET /api/suppliers/me
+ * Récupérer le profil fournisseur du user connecté
  */
 export const getMySupplierProfile = async (req, res) => {
   try {
-    const userId = req.user.userId;
+    const userId = req.user.id;
 
     const supplier = await prisma.supplier.findFirst({
       where: { userId },
@@ -25,19 +26,85 @@ export const getMySupplierProfile = async (req, res) => {
 };
 
 /**
+ * POST /api/suppliers/profile
+ * Création du profil fournisseur
+ */
+/**
+ * POST /api/suppliers/profile
+ * Création du profil fournisseur
+ */
+export const createSupplierProfile = async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const {
+      companyName,
+      companyAddress,
+      nif,
+      nrc,
+      contactName,
+      contactPhone,
+    } = req.body;
+
+    // Champs obligatoires EXACTEMENT selon Prisma
+    if (
+      !companyName ||
+      !companyAddress ||
+      !nif ||
+      !nrc ||
+      !contactName ||
+      !contactPhone
+    ) {
+      return res.status(400).json({
+        message: "Champs obligatoires manquants",
+      });
+    }
+
+    const existingSupplier = await prisma.supplier.findFirst({
+      where: { userId },
+    });
+
+    if (existingSupplier) {
+      return res.status(400).json({
+        message: "Profil fournisseur déjà existant",
+      });
+    }
+
+    const supplier = await prisma.supplier.create({
+      data: {
+        companyName,
+        companyAddress,
+        nif,
+        nrc,
+        contactName,
+        contactPhone,
+        userId,
+        status: "PENDING",
+      },
+    });
+
+    res.status(201).json(supplier);
+  } catch (error) {
+    console.error("CREATE SUPPLIER ERROR:", error);
+    res.status(500).json({ message: "Erreur serveur" });
+  }
+};
+
+
+/**
  * PUT /api/suppliers/orders/:id/status
+ * Mise à jour du statut d’une commande fournisseur
  */
 export const updateOrderStatus = async (req, res) => {
-  const userId = req.user.userId;
-  const { id } = req.params;
-  const { status } = req.body;
-
-  if (!status) {
-    return res.status(400).json({ message: "Statut manquant" });
-  }
-
   try {
-    // 1️⃣ Récupérer le supplier lié au user
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!status) {
+      return res.status(400).json({ message: "Statut manquant" });
+    }
+
     const supplier = await prisma.supplier.findFirst({
       where: { userId },
     });
@@ -46,7 +113,6 @@ export const updateOrderStatus = async (req, res) => {
       return res.status(403).json({ message: "Fournisseur non autorisé" });
     }
 
-    // 2️⃣ Récupérer la commande
     const order = await prisma.order.findUnique({
       where: { id: Number(id) },
     });
@@ -55,12 +121,10 @@ export const updateOrderStatus = async (req, res) => {
       return res.status(404).json({ message: "Commande introuvable" });
     }
 
-    // 3️⃣ Vérifier que la commande appartient à ce fournisseur
     if (order.supplierId !== supplier.id) {
       return res.status(403).json({ message: "Accès interdit" });
     }
 
-    // 4️⃣ Mise à jour du statut
     const updatedOrder = await prisma.order.update({
       where: { id: Number(id) },
       data: { status },

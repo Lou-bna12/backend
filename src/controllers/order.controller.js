@@ -1,43 +1,40 @@
-
-
 import prisma from "../prisma.js";
 
+// ==========================
+// CREATE ORDER (CLIENT)
+// ==========================
 export const createOrder = async (req, res) => {
-  const clientId = req.user.userId;
-  const { supplierId, items } = req.body;
+  const clientId = req.user.id;
+  const { items } = req.body;
 
-  if (!supplierId || !items || items.length === 0) {
-    return res.status(400).json({ message: "Commande invalide" });
+  if (!items || items.length === 0) {
+    return res.status(400).json({ message: "Commande vide" });
   }
 
   try {
     const result = await prisma.$transaction(async (tx) => {
-      // 1️⃣ Vérifier le fournisseur
-      const supplier = await tx.supplier.findUnique({
-        where: { id: supplierId },
+      // 1️⃣ Créer la commande globale
+      const order = await tx.order.create({
+        data: {
+          clientId,
+          status: "CREATED",
+        },
       });
 
-      if (!supplier || supplier.status !== "APPROVED") {
-        throw new Error("Fournisseur non valide");
-      }
-
-      let orderItems = [];
       let totalAmount = 0;
 
-      // 2️⃣ Vérifier produits + stock
+      // 2️⃣ Créer les OrderItems
       for (const item of items) {
         const product = await tx.product.findUnique({
           where: { id: item.productId },
         });
 
         if (!product || !product.isActive) {
-          throw new Error(`Produit ${item.productId} indisponible`);
+          throw new Error("Produit indisponible");
         }
 
         if (product.stock < item.quantity) {
-          throw new Error(
-            `Stock insuffisant pour le produit ${product.name}`
-          );
+          throw new Error(`Stock insuffisant pour ${product.name}`);
         }
 
         // décrément stock
@@ -48,57 +45,33 @@ export const createOrder = async (req, res) => {
           },
         });
 
-        orderItems.push({
-          productId: product.id,
-          quantity: item.quantity,
-          price: product.price,
+        await tx.orderItem.create({
+          data: {
+            orderId: order.id,
+            productId: product.id,
+            supplierId: product.supplierId,
+            quantity: item.quantity,
+            price: product.price,
+            status: "CREATED",
+          },
         });
 
         totalAmount += product.price * item.quantity;
       }
 
-      // 3️⃣ Créer la commande
-      const order = await tx.order.create({
-        data: {
-          clientId,
-          supplierId,
-          status: "CREATED",
-          items: {
-            create: orderItems,
-          },
-        },
-        include: {
-          items: true,
-        },
-      });
-
-      return { order, totalAmount };
+      return {
+        orderId: order.id,
+        totalAmount,
+      };
     });
 
     res.status(201).json({
       message: "Commande créée avec succès",
-      order: result.order,
+      orderId: result.orderId,
       totalAmount: result.totalAmount,
     });
   } catch (error) {
-    console.error(error.message);
+    console.error("CREATE ORDER ERROR:", error.message);
     res.status(400).json({ message: error.message });
   }
-};
-
-
-export const getMyOrders = async (req, res) => {
-  const clientId = req.user.userId;
-
-  const orders = await prisma.order.findMany({
-    where: { clientId },
-    include: {
-      items: {
-        include: { product: true },
-      },
-      supplier: true,
-    },
-  });
-
-  res.json(orders);
 };
